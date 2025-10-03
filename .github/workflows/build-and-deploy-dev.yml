@@ -1,0 +1,39 @@
+name: Build and Deploy Dev (local)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-dev:
+    runs-on: self-hosted
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build local Docker image
+        run: |
+          IMAGE=php-hello
+          TAG=${{ github.sha }}
+          docker build -t ${IMAGE}:${TAG} -t ${IMAGE}:main .
+
+      - name: (Re)deploy Dev on :8081
+        run: |
+          set -e
+          IMAGE=php-hello
+          TAG=${{ github.sha }}
+          CN=php-hello-dev
+
+          docker rm -f $CN 2>/dev/null || true
+          docker run -d --name $CN --restart unless-stopped -p 8081:80 ${IMAGE}:${TAG}
+
+      - name: Health check Dev
+        run: |
+          for i in {1..20}; do
+            curl -fsS http://localhost:8081/health && exit 0
+            sleep 1
+          done
+          echo "Dev health failed" >&2
+          docker logs php-hello-dev || true
+          exit 1

@@ -1,0 +1,47 @@
+name: Promote to Staging (local)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Docker image tag to deploy (e.g. commit SHA or 'main')"
+        required: true
+        type: string
+
+jobs:
+  staging:
+    runs-on: self-hosted
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure image exists locally
+        id: img
+        run: |
+          IMAGE=php-hello
+          TAG="${{ inputs.image_tag }}"
+          if ! docker image inspect ${IMAGE}:${TAG} >/dev/null 2>&1; then
+            echo "Image ${IMAGE}:${TAG} not found locally." >&2
+            echo "Build it first (push to main) or use a tag that exists (e.g. 'main')." >&2
+            exit 1
+          fi
+
+      - name: (Re)deploy Staging on :8082
+        run: |
+          set -e
+          IMAGE=php-hello
+          TAG="${{ inputs.image_tag }}"
+          CN=php-hello-stg
+
+          docker rm -f $CN 2>/dev/null || true
+          docker run -d --name $CN --restart unless-stopped -p 8082:80 ${IMAGE}:${TAG}
+
+      - name: Health check Staging
+        run: |
+          for i in {1..20}; do
+            curl -fsS http://localhost:8082/health && exit 0
+            sleep 1
+          done
+          echo "Staging health failed" >&2
+          docker logs php-hello-stg || true
+          exit 1

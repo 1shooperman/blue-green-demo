@@ -16,25 +16,29 @@ jobs:
       url: http://localhost:8080
 
     steps:
-      - name: Verify image exists locally (no build)
+      - name: Verify image exists locally
         run: |
           set -e
           IMAGE=php-hello
           TAG="${{ inputs.image_tag }}"
           docker image inspect ${IMAGE}:${TAG} >/dev/null 2>&1 || {
-            echo "Image ${IMAGE}:${TAG} not found locally. Build it first (push to main) or use 'main'."; exit 1; }
+            echo "Image ${IMAGE}:${TAG} not found locally."; exit 1; }
 
-      - name: Prepare network and write configs
+      - name: Prepare network and config dir
+        id: prep
         run: |
           set -e
           NET=php-hello-net
           GDIR="$HOME/.php-hello-gateway"
           mkdir -p "$GDIR"
           docker network create $NET 2>/dev/null || true
+          echo "net=$NET"   >> $GITHUB_OUTPUT
+          echo "gdir=$GDIR" >> $GITHUB_OUTPUT
 
           cat > "$GDIR/site.conf" <<'NGINX'
           server {
-            listen 80;
+            listen 80 default_server;
+            server_name _;
             location / {
               proxy_pass http://app_upstream;
               proxy_set_header Host $host;
@@ -43,109 +47,84 @@ jobs:
           }
           NGINX
 
-          cat > "$GDIR/upstream-blue" <<'NGX'
-          upstream app_upstream { server php-hello-blue:80; }
-          NGX
-          cat > "$GDIR/upstream-green" <<'NGX'
-          upstream app_upstream { server php-hello-green:80; }
-          NGX
+          # Ensure an empty file we can mount over nginx's default.conf
+          : > "$GDIR/empty.conf"
 
-          # If link missing, default to BLUE
-          [ -e "$GDIR/upstream.conf" ] || ln -s "$GDIR/upstream-blue" "$GDIR/upstream.conf"
+      - name: Decide target color (first run blue, else idle of the two)
+        id: decide
+        run: |
+          set -e
+          is_blue_running=$(docker ps --format '{{.Names}}' | grep -w '^php-hello-blue$' || true)
+          is_green_running=$(docker ps --format '{{.Names}}' | grep -w '^php-hello-green$' || true)
+          if [ -z "$is_blue_running$is_green_running" ]; then
+            ACTIVE=""
+            TARGET="blue"   # first run
+          else
+            if [ -n "$is_blue_running" ]; then ACTIVE="blue"; TARGET="green"; else ACTIVE="green"; TARGET="blue"; fi
+          fi
+          echo "active=$ACTIVE" >> $GITHUB_OUTPUT
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "Promoting to: $TARGET (active=$ACTIVE)"
 
-      - name: Bootstrap first run if needed (create both colors)
-        id: bootstrap
+      - name: Start target backend and health-check
+        id: backend
         run: |
           set -e
           IMAGE=php-hello
           TAG="${{ inputs.image_tag }}"
-          NET=php-hello-net
-          GDIR="$HOME/.php-hello-gateway"
+          NET="${{ steps.prep.outputs.net }}"
+          TARGET="${{ steps.decide.outputs.target }}"
 
-          have_blue=$(docker ps -a --format '{{.Names}}' | grep -w "^php-hello-blue$" || true)
-          have_green=$(docker ps -a --format '{{.Names}}' | grep -w "^php-hello-green$" || true)
+          docker rm -f php-hello-${TARGET} 2>/dev/null || true
+          docker run -d --name php-hello-${TARGET} --restart unless-stopped \
+            --network "$NET" ${IMAGE}:${TAG}
 
-          if [ -z "$have_blue$have_green" ]; then
-            echo "first_run=true" >> $GITHUB_OUTPUT
+          for i in {1..40}; do
+            docker exec php-hello-${TARGET} sh -lc "wget -qO- http://127.0.0.1/health >/dev/null" && break || sleep 1
+          done
+          docker exec php-hello-${TARGET} sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null
 
-            # Bring up BOTH colors with the same tag so gateway can resolve either
-            docker run -d --name php-hello-blue  --restart unless-stopped --network $NET ${IMAGE}:${TAG}
-            docker run -d --name php-hello-green --restart unless-stopped --network $NET ${IMAGE}:${TAG}
+          # Write upstream.conf to point at the TARGET by name (DNS ok because it's running)
+          GDIR="${{ steps.prep.outputs.gdir }}"
+          cat > "$GDIR/upstream.conf" <<NGX
+          upstream app_upstream { server php-hello-${TARGET}:80; }
+          NGX
 
-            # Health check both (quick)
-            for C in php-hello-blue php-hello-green; do
-              for i in {1..30}; do
-                docker exec $C sh -lc "wget -qO- http://127.0.0.1/health >/dev/null" && break || sleep 1
-              done
-              docker exec $C sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null
-            done
-
-            # Point upstream to BLUE for the initial serve
-            ln -sfn "$GDIR/upstream-blue" "$GDIR/upstream.conf"
-          else
-            echo "first_run=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Start or reload gateway (always after containers exist)
+      - name: Start/Reload gateway (disable default vhost)
         run: |
           set -e
-          NET=php-hello-net
-          GDIR="$HOME/.php-hello-gateway"
+          NET="${{ steps.prep.outputs.net }}"
+          GDIR="${{ steps.prep.outputs.gdir }}"
           GW=php-hello-gateway
 
-          # If gateway exists but not running, remove it to avoid stale mounts
+          # If gateway exists but isn't running cleanly, remove it
           if docker ps -a --format '{{.Names}} {{.Status}}' | grep -q "^${GW}\b"; then
             docker ps --format '{{.Names}}' | grep -q "^${GW}$" || docker rm -f $GW || true
           fi
 
           if docker ps --format '{{.Names}}' | grep -q "^${GW}$"; then
+            docker exec $GW nginx -t || { docker logs $GW; exit 1; }
             docker exec $GW nginx -s reload || true
           else
+            docker rm -f $GW 2>/dev/null || true
             docker run -d --name $GW --restart unless-stopped \
-              --network $NET -p 8080:80 \
+              --network "$NET" -p 8080:80 \
               -v "$GDIR/site.conf:/etc/nginx/conf.d/site.conf:ro" \
               -v "$GDIR/upstream.conf:/etc/nginx/conf.d/upstream.conf:ro" \
+              -v "$GDIR/empty.conf:/etc/nginx/conf.d/default.conf:ro" \
               nginx:stable
+            sleep 1
+            docker exec $GW nginx -t || { docker logs $GW; exit 1; }
           fi
 
-      - name: Promote (only if not first run) - start idle with new tag, flip, stop old
-        if: steps.bootstrap.outputs.first_run == 'false'
+      - name: Stop old color (if any)
+        if: steps.decide.outputs.active != ''
         run: |
           set -e
-          IMAGE=php-hello
-          TAG="${{ inputs.image_tag }}"
-          NET=php-hello-net
-          GDIR="$HOME/.php-hello-gateway"
-          GW=php-hello-gateway
-
-          if readlink "$GDIR/upstream.conf" | grep -q 'upstream-blue'; then
-            ACTIVE=blue; IDLE=green
-          else
-            ACTIVE=green; IDLE=blue
-          fi
-          echo "Active=$ACTIVE, Idle=$IDLE"
-
-          docker rm -f php-hello-${IDLE} 2>/dev/null || true
-          docker run -d --name php-hello-${IDLE} --restart unless-stopped --network $NET ${IMAGE}:${TAG}
-
-          for i in {1..30}; do
-            docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health >/dev/null" && break || sleep 1
-          done
-          docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null
-
-          # Flip to IDLE
-          if [ "$IDLE" = "blue" ]; then
-            ln -sfn "$GDIR/upstream-blue" "$GDIR/upstream.conf"
-          else
-            ln -sfn "$GDIR/upstream-green" "$GDIR/upstream.conf"
-          fi
-          docker exec $GW nginx -s reload || true
-
-          # Stop old color
-          sleep 2
-          docker rm -f php-hello-${ACTIVE} 2>/dev/null || true
+          OLD="${{ steps.decide.outputs.active }}"
+          docker rm -f php-hello-${OLD} 2>/dev/null || true
 
       - name: Smoke test gateway
         run: |
-          for i in {1..20}; do curl -fsS http://localhost:8080/health && exit 0; sleep 1; done
+          for i in {1..30}; do curl -fsS http://localhost:8080/health && exit 0; sleep 1; done
           echo "Prod gateway health failed"; docker logs php-hello-gateway || true; exit 1

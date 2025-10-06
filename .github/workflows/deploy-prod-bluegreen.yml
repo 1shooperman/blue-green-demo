@@ -56,10 +56,11 @@ jobs:
           upstream app_upstream { server php-hello-green:80; }
           NGX
 
-          # Ensure symlink file exists (we'll set it to the idle color later)
-          [ -e "$GDIR/upstream.conf" ] || ln -s "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
-
-      - name: Start idle color first, then point upstream to it
+          if [ ! -e "$GDIR/upstream.conf" ]; then
+            ln -s "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
+          fi
+      - name: Bootstrap first run if needed (create both colors)
+        id: bootstrap
         run: |
           set -e
           IMAGE=php-hello
@@ -67,56 +68,38 @@ jobs:
           NET=php-hello-net
           GDIR="$HOME/.php-hello-gateway"
 
-          # Determine active/idle from current symlink (if pointing to blue, active=blue)
-          if readlink "$GDIR/upstream.conf" | grep -q 'upstream-blue.conf'; then
-            ACTIVE=blue; IDLE=green
-          else
-            ACTIVE=green; IDLE=blue
-          fi
-          echo "Active=$ACTIVE, Idle=$IDLE"
+          have_blue=$(docker ps -a --format '{{.Names}}' | grep -w "^php-hello-blue$" || true)
+          have_green=$(docker ps -a --format '{{.Names}}' | grep -w "^php-hello-green$" || true)
 
-          # Start (or restart) the IDLE color on the shared network
-          docker rm -f php-hello-${IDLE} 2>/dev/null || true
-          docker run -d --name php-hello-${IDLE} --restart unless-stopped \
-            --network $NET ${IMAGE}:${TAG}
+          if [ -z "$have_blue$have_green" ]; then
+            echo "first_run=true" >> $GITHUB_OUTPUT
 
-          # Health check the idle color in its own namespace
-          for i in {1..30}; do
-            if docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health >/dev/null"; then
-              echo "Idle color (${IDLE}) is healthy"
-              break
-            fi
-            sleep 1
-          done
-          docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null
+            # Bring up BOTH colors with the same tag so gateway can resolve either
+            docker run -d --name php-hello-blue  --restart unless-stopped --network $NET ${IMAGE}:${TAG}
+            docker run -d --name php-hello-green --restart unless-stopped --network $NET ${IMAGE}:${TAG}
 
-          # Point upstream to the IDLE we just verified
-          if [ "$IDLE" = "blue" ]; then
+            # Health check both (quick)
+            for C in php-hello-blue php-hello-green; do
+              for i in {1..30}; do
+                docker exec $C sh -lc "wget -qO- http://127.0.0.1/health >/dev/null" && break || sleep 1
+              done
+              docker exec $C sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null
+            done
+
+            # Point upstream to BLUE for the initial serve
             ln -sfn "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
           else
-            ln -sfn "$GDIR/upstream-green.conf" "$GDIR/upstream.conf"
-          fi
+            echo "first_run=false" >> $GITHUB_OUTPUT
+          fi    
 
-      - name: Start or reload gateway AFTER upstream points to a live backend
+      - name: Start/ensure gateway (nginx on :8080)
         run: |
           set -e
-          NET=php-hello-net
           GDIR="$HOME/.php-hello-gateway"
+          NET=php-hello-net
           GW=php-hello-gateway
 
-          # If an old/exited gateway exists, remove it
-          if docker ps -a --format '{{.Names}} {{.Status}}' | grep -q "^${GW}\b"; then
-            # If not running cleanly, blow it away to avoid stale mounts
-            if ! docker ps --format '{{.Names}}' | grep -q "^${GW}$"; then
-              docker rm -f $GW || true
-            fi
-          fi
-
-          if docker ps --format '{{.Names}}' | grep -q "^${GW}$"; then
-            # running: just reload nginx to pick up the new symlink target
-            docker exec $GW nginx -s reload || true
-          else
-            # start fresh gateway; now upstream.conf points to a resolvable container
+          if ! docker ps --format '{{.Names}}' | grep -q "^${GW}$"; then
             docker rm -f $GW 2>/dev/null || true
             docker run -d --name $GW --restart unless-stopped \
               --network $NET -p 8080:80 \
@@ -125,26 +108,62 @@ jobs:
               nginx:stable
           fi
 
-      - name: Stop old color and smoke test gateway
+      - name: Deploy to idle color, health check, flip, and drain old
         run: |
           set -e
+          IMAGE=php-hello
+          TAG="${{ inputs.image_tag }}"
+          NET=php-hello-net
           GDIR="$HOME/.php-hello-gateway"
           GW=php-hello-gateway
 
-          # Figure out which color is now active (the one we pointed to)
+          # Determine active/idle by the upstream symlink
           if readlink "$GDIR/upstream.conf" | grep -q 'upstream-blue.conf'; then
-            NEW_ACTIVE=blue; OLD=green
+            ACTIVE=blue
+            IDLE=green
           else
-            NEW_ACTIVE=green; OLD=blue
+            ACTIVE=green
+            IDLE=blue
           fi
 
-          # Drain old color briefly, then remove it if present
-          sleep 2
-          docker rm -f php-hello-${OLD} 2>/dev/null || true
+          echo "Active=$ACTIVE, Idle=$IDLE"
 
-          # Final smoke test through the gateway
+          # (Re)start idle color on the shared network (no host ports)
+          docker rm -f php-hello-${IDLE} 2>/dev/null || true
+          docker run -d --name php-hello-${IDLE} --restart unless-stopped \
+            --network $NET ${IMAGE}:${TAG}
+
+          # Health check the idle color from inside the container
+          for i in {1..30}; do
+            if docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health >/dev/null"; then
+              echo "Idle color (${IDLE}) is healthy"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify succeeded
+          docker exec php-hello-${IDLE} sh -lc "wget -qO- http://127.0.0.1/health" >/dev/null || (echo "Health failed" >&2; exit 1)
+
+          # Flip gateway to point at the idle color and reload nginx
+          if [ "$IDLE" = "blue" ]; then
+            ln -sfn "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
+          else
+            ln -sfn "$GDIR/upstream-green.conf" "$GDIR/upstream.conf"
+          fi
+          docker exec $GW nginx -s reload || true
+          echo "Flipped gateway to $IDLE"
+
+          # Drain old and stop active color (optional small delay)
+          sleep 2
+          docker rm -f php-hello-${ACTIVE} 2>/dev/null || true
+
+      - name: Smoke test production gateway
+        run: |
           for i in {1..20}; do
             curl -fsS http://localhost:8080/health && exit 0
             sleep 1
           done
-          echo "Prod gateway health failed"; docker logs $GW || true; exit 1
+          echo "Prod gateway health failed" >&2
+          docker logs php-hello-gateway || true
+          exit 1

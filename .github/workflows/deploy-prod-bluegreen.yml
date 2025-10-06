@@ -33,7 +33,6 @@ jobs:
           docker network create $NET 2>/dev/null || true
 
           cat > "$GDIR/site.conf" <<'NGINX'
-          include /etc/nginx/conf.d/upstream.conf;
           server {
             listen 80;
             location / {
@@ -44,15 +43,15 @@ jobs:
           }
           NGINX
 
-          cat > "$GDIR/upstream-blue.conf" <<'NGX'
+          cat > "$GDIR/upstream-blue" <<'NGX'
           upstream app_upstream { server php-hello-blue:80; }
           NGX
-          cat > "$GDIR/upstream-green.conf" <<'NGX'
+          cat > "$GDIR/upstream-green" <<'NGX'
           upstream app_upstream { server php-hello-green:80; }
           NGX
 
           # If link missing, default to BLUE
-          [ -e "$GDIR/upstream.conf" ] || ln -s "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
+          [ -e "$GDIR/upstream.conf" ] || ln -s "$GDIR/upstream-blue" "$GDIR/upstream.conf"
 
       - name: Bootstrap first run if needed (create both colors)
         id: bootstrap
@@ -82,7 +81,7 @@ jobs:
             done
 
             # Point upstream to BLUE for the initial serve
-            ln -sfn "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
+            ln -sfn "$GDIR/upstream-blue" "$GDIR/upstream.conf"
           else
             echo "first_run=false" >> $GITHUB_OUTPUT
           fi
@@ -119,7 +118,7 @@ jobs:
           GDIR="$HOME/.php-hello-gateway"
           GW=php-hello-gateway
 
-          if readlink "$GDIR/upstream.conf" | grep -q 'upstream-blue.conf'; then
+          if readlink "$GDIR/upstream.conf" | grep -q 'upstream-blue'; then
             ACTIVE=blue; IDLE=green
           else
             ACTIVE=green; IDLE=blue
@@ -136,9 +135,9 @@ jobs:
 
           # Flip to IDLE
           if [ "$IDLE" = "blue" ]; then
-            ln -sfn "$GDIR/upstream-blue.conf" "$GDIR/upstream.conf"
+            ln -sfn "$GDIR/upstream-blue" "$GDIR/upstream.conf"
           else
-            ln -sfn "$GDIR/upstream-green.conf" "$GDIR/upstream.conf"
+            ln -sfn "$GDIR/upstream-green" "$GDIR/upstream.conf"
           fi
           docker exec $GW nginx -s reload || true
 

@@ -1,4 +1,4 @@
 <?php
 header('Content-Type: text/plain');
 echo 'greetings programs!';
-echo "an update."
+echo "an update.";
